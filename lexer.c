@@ -92,15 +92,15 @@ static void do_cmdsub(Str *out, const char *cmd_text)
         if (!mutable) _exit(1);
 
         int nt = 0;
-        char **toks = tokenize(mutable, &nt);
+        char **toks = tokenize_raw(mutable, &nt);
         free(mutable);
 
         if (toks && nt > 0) {
-            Pipeline *pip = parse_pipeline(toks, nt, cmd_text);
+            AstNode *ast = parse_program(toks, nt);
             free_tokens(toks);
-            if (pip) {
-                int st = execute_pipeline(pip);
-                free_pipeline(pip);
+            if (ast) {
+                int st = execute_ast(ast, &g_ctx);
+                free_ast(ast);
                 _exit(st);
             }
         }
@@ -237,7 +237,8 @@ static void expand_dollar(Str *out, const char **pp)
 
 static int is_op_char(char c)
 {
-    return c == '|' || c == '>' || c == '<' || c == '&';
+    return c == '|' || c == '>' || c == '<' || c == '&'
+        || c == '{' || c == '}' || c == ';';
 }
 
 /*
@@ -284,7 +285,20 @@ char **tokenize(char *line, int *out_ntokens)
     while (*p) {
         /* skip horizontal whitespace */
         while (*p == ' ' || *p == '\t') p++;
-        if (*p == '\0' || *p == '\n') break;
+        if (*p == '\0') break;
+
+        /* newline → statement separator (like ;) */
+        if (*p == '\n') {
+            if (n < MAX_ARGS) tokens[n++] = strdup(";");
+            p++;
+            continue;
+        }
+
+        /* # comment → skip to end of line */
+        if (*p == '#') {
+            while (*p && *p != '\n') p++;
+            continue;
+        }
 
         if (n >= MAX_ARGS) {
             fprintf(stderr, "nsh: too many tokens (max %d)\n", MAX_ARGS);
@@ -391,4 +405,177 @@ void free_tokens(char **tokens)
     for (int i = 0; tokens[i]; i++)
         free(tokens[i]);
     free(tokens);
+}
+
+/* ── raw (deferred-expansion) tokenizer ─────────────────────────────────── */
+
+/*
+ * Store a $... expression as a literal string — no environment lookup.
+ * Used by tokenize_raw so that $VAR, ${VAR}, $(), $?, etc. are kept
+ * verbatim in the token and expanded at execution time by expand_word().
+ */
+static void raw_dollar_lit(Str *out, const char **pp)
+{
+    const char *p = *pp;
+    str_push(out, '$');
+
+    if (*p == '(') {
+        str_push(out, '('); p++;
+        int depth = 1;
+        while (*p && depth > 0) {
+            if (*p == '(') depth++;
+            else if (*p == ')') {
+                depth--;
+                if (!depth) { str_push(out, ')'); p++; break; }
+            }
+            str_push(out, *p++);
+        }
+    } else if (*p == '{') {
+        str_push(out, '{'); p++;
+        while (*p && *p != '}') str_push(out, *p++);
+        if (*p == '}') { str_push(out, '}'); p++; }
+    } else if (*p == '?' || *p == '$' || *p == '!' || *p == '#') {
+        str_push(out, *p++);
+    } else if (isalpha((unsigned char)*p) || *p == '_') {
+        while (isalnum((unsigned char)*p) || *p == '_') str_push(out, *p++);
+    }
+    /* bare $ with nothing recognisable → already pushed the '$' */
+    *pp = p;
+}
+
+/*
+ * tokenize_raw — identical to tokenize but defers $-expansion and ~ expansion.
+ * The tokens it produces are suitable for embedding in the AST; they will be
+ * fully expanded at execution time by expand_word() / expand_argv().
+ */
+char **tokenize_raw(char *line, int *out_ntokens)
+{
+    char **tokens = calloc(MAX_ARGS + 1, sizeof(char *));
+    if (!tokens) { perror("calloc"); return NULL; }
+    int n = 0;
+    const char *p = line;
+
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') break;
+
+        if (*p == '\n') {
+            if (n < MAX_ARGS) tokens[n++] = strdup(";");
+            p++;
+            continue;
+        }
+        if (*p == '#') { while (*p && *p != '\n') p++; continue; }
+
+        if (n >= MAX_ARGS) {
+            fprintf(stderr, "nsh: too many tokens (max %d)\n", MAX_ARGS);
+            break;
+        }
+
+        if (is_op_char(*p)) { tokens[n++] = read_op(&p); continue; }
+
+        Str word;
+        str_init(&word);
+
+        /* tilde kept literal — expanded at execution time by expand_word */
+        if (*p == '~' && (*(p+1) == '/' || *(p+1) == '\0' ||
+                           *(p+1) == ' ' || *(p+1) == '\t' || is_op_char(*(p+1)))) {
+            str_push(&word, '~');
+            p++;
+        }
+
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && !is_op_char(*p)) {
+            if (*p == '\'') {
+                p++;
+                while (*p && *p != '\'') str_push(&word, *p++);
+                if (*p) p++;
+
+            } else if (*p == '"') {
+                p++;
+                while (*p && *p != '"') {
+                    if (*p == '\\') {
+                        char next = *(p + 1);
+                        if (next == '$' || next == '"' || next == '\\') {
+                            p++;
+                            str_push(&word, *p++);
+                        } else if (next == '\n') {
+                            p += 2;
+                        } else {
+                            str_push(&word, *p++);
+                        }
+                    } else if (*p == '$') {
+                        p++;
+                        raw_dollar_lit(&word, &p);   /* keep literal */
+                    } else {
+                        str_push(&word, *p++);
+                    }
+                }
+                if (*p) p++;
+
+            } else if (*p == '\\') {
+                p++;
+                if (*p == '\n') p++;
+                else if (*p) str_push(&word, *p++);
+
+            } else if (*p == '$') {
+                p++;
+                raw_dollar_lit(&word, &p);   /* keep literal */
+
+            } else {
+                str_push(&word, *p++);
+            }
+        }
+
+        tokens[n++] = str_take(&word);
+    }
+
+    tokens[n] = NULL;
+    if (out_ntokens) *out_ntokens = n;
+    return tokens;
+}
+
+/* ── word/argv expansion ─────────────────────────────────────────────────── */
+
+/*
+ * expand_word — expand $VAR, ${VAR}, $(), ~/ etc. in a single raw token
+ * against the current process environment.  Called at execution time.
+ */
+char *expand_word(const char *raw)
+{
+    if (!raw) return strdup("");
+
+    Str out;
+    str_init(&out);
+    const char *p = raw;
+
+    /* tilde at word start */
+    if (*p == '~' && (*(p+1) == '/' || *(p+1) == '\0')) {
+        const char *home = getenv("HOME");
+        if (home) str_cat(&out, home, strlen(home));
+        else      str_push(&out, '~');
+        p++;
+    }
+
+    while (*p) {
+        if (*p == '$') {
+            p++;
+            expand_dollar(&out, &p);
+        } else {
+            str_push(&out, *p++);
+        }
+    }
+    return str_take(&out);
+}
+
+/*
+ * expand_argv — expand an array of n raw tokens into a fresh heap-allocated
+ * NULL-terminated array.  Caller frees with free_tokens().
+ */
+char **expand_argv(char **raw, int n)
+{
+    char **out = calloc(n + 1, sizeof(char *));
+    if (!out) return NULL;
+    for (int i = 0; i < n; i++)
+        out[i] = expand_word(raw[i]);
+    out[n] = NULL;
+    return out;
 }

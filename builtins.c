@@ -1,6 +1,10 @@
 #include "shell.h"
 
-static const char *BUILTINS[] = { "cd", "exit", "pwd", "jobs", "fg", "bg", "replay", "shellenv", "clear", NULL };
+static const char *BUILTINS[] = {
+    "cd", "exit", "pwd", "jobs", "fg", "bg", "replay", "shellenv", "clear",
+    "break", "continue", "return", "set", "unset",
+    NULL
+};
 
 int is_builtin(const char *cmd)
 {
@@ -329,16 +333,45 @@ static int builtin_clear(void)
 
 /* ── dispatcher ─────────────────────────────────────────────────────────── */
 
+static int builtin_break(void)    { nsh_unwind = UNWIND_BREAK;    return 0; }
+static int builtin_continue(void) { nsh_unwind = UNWIND_CONTINUE; return 0; }
+
+static int builtin_return(char **argv, int argc)
+{
+    nsh_retval = (argc > 1) ? atoi(argv[1]) : last_status;
+    nsh_unwind = UNWIND_RETURN;
+    return nsh_retval;
+}
+
+static int builtin_set(char **argv, int argc)
+{
+    if (argc < 3) { fprintf(stderr, "usage: set name value\n"); return 1; }
+    setenv(argv[1], argv[2], 1);
+    return 0;
+}
+
+static int builtin_unset(char **argv, int argc)
+{
+    if (argc < 2) { fprintf(stderr, "usage: unset name\n"); return 1; }
+    unsetenv(argv[1]);
+    return 0;
+}
+
 int run_builtin(char **argv, int argc)
 {
-    if (strcmp(argv[0], "cd")     == 0) return builtin_cd(argv, argc);
-    if (strcmp(argv[0], "pwd")    == 0) return builtin_pwd();
-    if (strcmp(argv[0], "exit")   == 0) return builtin_exit(argv, argc);
-    if (strcmp(argv[0], "jobs")   == 0) return builtin_jobs();
-    if (strcmp(argv[0], "fg")     == 0) return builtin_fg(argv, argc);
-    if (strcmp(argv[0], "bg")     == 0) return builtin_bg(argv, argc);
+    if (strcmp(argv[0], "cd")       == 0) return builtin_cd(argv, argc);
+    if (strcmp(argv[0], "pwd")      == 0) return builtin_pwd();
+    if (strcmp(argv[0], "exit")     == 0) return builtin_exit(argv, argc);
+    if (strcmp(argv[0], "jobs")     == 0) return builtin_jobs();
+    if (strcmp(argv[0], "fg")       == 0) return builtin_fg(argv, argc);
+    if (strcmp(argv[0], "bg")       == 0) return builtin_bg(argv, argc);
     if (strcmp(argv[0], "replay")   == 0) return builtin_replay(argv, argc);
     if (strcmp(argv[0], "shellenv") == 0) return builtin_shellenv(argv, argc);
     if (strcmp(argv[0], "clear")    == 0) return builtin_clear();
+    if (strcmp(argv[0], "break")    == 0) return builtin_break();
+    if (strcmp(argv[0], "continue") == 0) return builtin_continue();
+    if (strcmp(argv[0], "return")   == 0) return builtin_return(argv, argc);
+    if (strcmp(argv[0], "set")      == 0) return builtin_set(argv, argc);
+    if (strcmp(argv[0], "unset")    == 0) return builtin_unset(argv, argc);
     return 127;
 }

@@ -42,8 +42,9 @@ static int64_t timer_elapsed_ms(void)
 
 static void shell_init(void)
 {
-    config_load();  /* read ~/.config/nsh/config.toml before anything else */
-    hist_open();    /* open DB unconditionally — works in both interactive and script mode */
+    config_load();
+    hist_open();
+    execctx_init(&g_ctx);
 
     if (!isatty(STDIN_FILENO))
         return;
@@ -59,7 +60,7 @@ static void shell_init(void)
     signal(SIGTTOU, SIG_IGN);
     signal(SIGTTIN, SIG_IGN);
     signal(SIGTSTP, SIG_IGN);
-    signal(SIGINT,  sigint_handler);  /* Ctrl+C: jump back to REPL top */
+    signal(SIGINT,  sigint_handler);
     signal(SIGQUIT, SIG_IGN);
 
     struct sigaction sa;
@@ -74,111 +75,173 @@ static void shell_init(void)
     hist_seed_interactive();
 }
 
+/* ── brace depth counter ─────────────────────────────────────────────────── */
+
+/*
+ * Count net open braces in a token array so the REPL knows whether to keep
+ * reading more lines before parsing (multi-line blocks).
+ */
+static int brace_depth(char **toks, int n)
+{
+    int depth = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(toks[i], "{") == 0) depth++;
+        else if (strcmp(toks[i], "}") == 0) depth--;
+    }
+    return depth;
+}
+
+/* ── execute one logical line ────────────────────────────────────────────── */
+
+static void run_input(const char *input, int interactive)
+{
+    int ntokens = 0;
+    char **tokens = tokenize((char *)input, &ntokens);
+    if (!tokens || ntokens == 0) { free_tokens(tokens); return; }
+
+    AstNode *ast = parse_program(tokens, ntokens);
+    free_tokens(tokens);
+    if (!ast) { last_status = 1; return; }
+
+    timer_begin();
+    last_status = execute_ast(ast, &g_ctx);
+    int64_t elapsed = timer_elapsed_ms();
+
+    if (interactive && g_config.prompt_show_ms >= 0 &&
+        elapsed >= (int64_t)g_config.prompt_show_ms)
+        fprintf(stderr, "\033[0;90m  took %lldms\033[0m\n", (long long)elapsed);
+
+    free_ast(ast);
+}
+
 /* ── REPL ───────────────────────────────────────────────────────────────── */
 
-int main(void)
+int main(int argc, char *argv[])
 {
     shell_init();
 
+    /* ── script file mode ── */
+    if (argc >= 2) {
+        int status = execute_script_file(argv[1]);
+        execctx_free(&g_ctx);
+        hist_close();
+        return status;
+    }
+
+    /* ── interactive / pipe mode ── */
     while (1) {
-        /* Ctrl+C longjmps here — terminal ECHOCTL already printed "^C",
-         * we just need a newline before the next prompt */
         if (sigsetjmp(ctrl_c_jump, 1) != 0) {
             write(STDOUT_FILENO, "\n", 1);
             last_status = 1;
         }
 
-        if (got_sigchld) {
-            got_sigchld = 0;
-            reap_jobs();
-        }
-        shellenv_check_reload();    /* drain kqueue, hot-reload changed .shellenv */
+        if (got_sigchld) { got_sigchld = 0; reap_jobs(); }
+        shellenv_check_reload();
 
-        char *line;
+        /* ── accumulate a complete statement (handles multi-line blocks) ── */
+        char  *accum  = NULL;   /* heap-allocated accumulation buffer */
+        size_t accum_len = 0;
+        int    depth  = 0;
+        int    first_line = 1;
 
-        if (isatty(STDIN_FILENO)) {
-            char *prompt = make_prompt();
-            line = line_editor_read(prompt);
-            free(prompt);
+        for (;;) {
+            char *line = NULL;
 
-            if (!line) {
+            if (isatty(STDIN_FILENO)) {
+                char *prompt;
+                if (first_line) {
+                    prompt = make_prompt();
+                } else {
+                    /* continuation prompt */
+                    prompt = strdup("... ");
+                }
+                line = line_editor_read(prompt);
+                free(prompt);
+
+                if (!line) {
+                    if (line_editor_was_interrupted()) {
+                        write(STDOUT_FILENO, "\n", 1);
+                        line_editor_clear_interrupt();
+                        last_status = 1;
+                        free(accum);
+                        accum = NULL;
+                        goto next_iteration;
+                    }
+                    /* EOF */
+                    printf("\n");
+                    line_editor_shutdown();
+                    shellenv_shutdown();
+                    hist_close();
+                    execctx_free(&g_ctx);
+                    free(accum);
+                    return last_status;
+                }
+
                 if (line_editor_was_interrupted()) {
                     write(STDOUT_FILENO, "\n", 1);
                     line_editor_clear_interrupt();
+                    free(line);
                     last_status = 1;
-                    continue;
+                    free(accum);
+                    accum = NULL;
+                    goto next_iteration;
                 }
-                printf("\n");
-                line_editor_shutdown();
-                shellenv_shutdown();
-                hist_close();
-                break;
+            } else {
+                /* non-interactive (pipe / stdin redirect) */
+                static char buf[NSH_MAX_INPUT];
+                if (!fgets(buf, sizeof(buf), stdin)) {
+                    free(accum);
+                    return last_status;
+                }
+                size_t l = strlen(buf);
+                if (l > 0 && buf[l-1] == '\n') buf[l-1] = '\0';
+                line = buf;
             }
 
-            if (line_editor_was_interrupted()) {
-                write(STDOUT_FILENO, "\n", 1);
-                line_editor_clear_interrupt();
-                free(line);
-                last_status = 1;
-                continue;
-            }
-        } else {
-            static char buf[NSH_MAX_INPUT];
-            if (!fgets(buf, sizeof(buf), stdin))
-                break;
-            size_t len = strlen(buf);
-            if (len > 0 && buf[len - 1] == '\n')
-                buf[len - 1] = '\0';
-            line = buf;
+            /* append line to accumulation buffer with a newline separator */
+            size_t line_len = strlen(line);
+            accum = realloc(accum, accum_len + line_len + 2);
+            memcpy(accum + accum_len, line, line_len);
+            accum_len += line_len;
+            accum[accum_len++] = '\n';
+            accum[accum_len]   = '\0';
+
+            if (isatty(STDIN_FILENO)) free(line);
+
+            /* check if braces are balanced */
+            int nt = 0;
+            char **toks = tokenize(accum, &nt);
+            depth = brace_depth(toks, nt);
+            free_tokens(toks);
+
+            if (depth <= 0) break;   /* complete statement */
+            first_line = 0;
         }
 
-        char *trimmed = line;
-        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        if (!accum || !accum[0]) { free(accum); goto next_iteration; }
+
+        /* trim leading whitespace to check for comment/empty */
+        const char *trimmed = accum;
+        while (*trimmed == ' ' || *trimmed == '\t' || *trimmed == '\n') trimmed++;
 
         if (*trimmed == '\0' || *trimmed == '#') {
-            if (isatty(STDIN_FILENO)) free(line);
-            continue;
+            free(accum);
+            goto next_iteration;
         }
 
         if (isatty(STDIN_FILENO))
             line_editor_add_history(trimmed);
 
-        int ntokens = 0;
-        char **tokens = tokenize(trimmed, &ntokens);
-
-        /* keep a copy of trimmed before free(line) for hist_add */
+        /* save for hist_add before run_input may mutate it */
         char saved[NSH_MAX_INPUT];
         strncpy(saved, trimmed, sizeof(saved) - 1);
         saved[sizeof(saved) - 1] = '\0';
 
-        if (isatty(STDIN_FILENO)) free(line);
+        run_input(accum, isatty(STDIN_FILENO));
+        free(accum);
 
-        if (!tokens || ntokens == 0) {
-            free_tokens(tokens);
-            continue;
-        }
+        hist_add(saved, last_status, 0);
 
-        Pipeline *p = parse_pipeline(tokens, ntokens, saved);
-        free_tokens(tokens);
-
-        if (!p) {
-            last_status = 1;
-            hist_add(saved, last_status, 0);
-            continue;
-        }
-
-        timer_begin();
-        last_status = execute_pipeline(p);
-        int64_t elapsed = timer_elapsed_ms();
-
-        if (isatty(STDIN_FILENO) &&
-            g_config.prompt_show_ms >= 0 &&
-            elapsed >= (int64_t)g_config.prompt_show_ms)
-            fprintf(stderr, "\033[0;90m  took %lldms\033[0m\n", (long long)elapsed);
-
-        free_pipeline(p);
-        hist_add(saved, last_status, elapsed);
+next_iteration:;
     }
-
-    return last_status;
 }

@@ -175,3 +175,343 @@ void free_pipeline(Pipeline *p)
     free(p->cmdline);
     free(p);
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Recursive-descent AST parser
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── token stream cursor ─────────────────────────────────────────────────── */
+
+typedef struct { char **toks; int n, pos; } TS;
+
+static const char *ts_peek(TS *ts)
+{
+    if (ts->pos >= ts->n) return NULL;
+    return ts->toks[ts->pos];
+}
+
+static const char *ts_next(TS *ts)
+{
+    if (ts->pos >= ts->n) return NULL;
+    return ts->toks[ts->pos++];
+}
+
+static int ts_eat(TS *ts, const char *tok)
+{
+    if (ts->pos < ts->n && strcmp(ts->toks[ts->pos], tok) == 0)
+        { ts->pos++; return 1; }
+    return 0;
+}
+
+/* skip consecutive semicolons / newlines */
+static void ts_skip_semi(TS *ts)
+{
+    while (ts->pos < ts->n && strcmp(ts->toks[ts->pos], ";") == 0)
+        ts->pos++;
+}
+
+/* ── forward declarations ────────────────────────────────────────────────── */
+static AstNode *parse_stmt(TS *ts);
+
+/* ── helpers ─────────────────────────────────────────────────────────────── */
+
+static AstNode *make_node(AstKind k)
+{
+    AstNode *n = calloc(1, sizeof(AstNode));
+    if (n) n->kind = k;
+    return n;
+}
+
+/*
+ * Collect raw tokens from ts into an AST_PIPELINE node, stopping before
+ * structural tokens: {  }  ;  else
+ * Tokens are stored unexpanded; execute_ast() will expand + execute them.
+ */
+static AstNode *parse_pipeline_ts(TS *ts)
+{
+    char *buf[MAX_ARGS];
+    int   n = 0;
+
+    while (ts->pos < ts->n) {
+        const char *t = ts->toks[ts->pos];
+        if (strcmp(t, "{")    == 0 || strcmp(t, "}") == 0 ||
+            strcmp(t, ";")    == 0 || strcmp(t, "else") == 0)
+            break;
+        buf[n++] = ts->toks[ts->pos++];
+        if (n >= MAX_ARGS) break;
+    }
+
+    if (n == 0) return NULL;
+
+    AstNode *node = make_node(AST_PIPELINE);
+    if (!node) return NULL;
+    node->u.pipeline.raw = malloc(n * sizeof(char *));
+    node->u.pipeline.n   = n;
+    for (int i = 0; i < n; i++)
+        node->u.pipeline.raw[i] = strdup(buf[i]);
+    return node;
+}
+
+/* ── block: { stmt; stmt; ... } ──────────────────────────────────────────── */
+
+static AstNode *parse_block(TS *ts)
+{
+    if (!ts_eat(ts, "{")) {
+        fprintf(stderr, "nsh: syntax error: expected '{'\n");
+        return NULL;
+    }
+
+    AstNode **stmts = NULL;
+    int nstmts = 0, cap = 0;
+
+    for (;;) {
+        ts_skip_semi(ts);
+        const char *peek = ts_peek(ts);
+        if (!peek || strcmp(peek, "}") == 0) break;
+
+        AstNode *s = parse_stmt(ts);
+        if (!s) break;
+
+        if (nstmts >= cap) {
+            cap = cap ? cap * 2 : 4;
+            stmts = realloc(stmts, cap * sizeof(AstNode *));
+        }
+        stmts[nstmts++] = s;
+    }
+
+    if (!ts_eat(ts, "}")) {
+        fprintf(stderr, "nsh: syntax error: expected '}'\n");
+        for (int i = 0; i < nstmts; i++) free_ast(stmts[i]);
+        free(stmts);
+        return NULL;
+    }
+
+    AstNode *node = make_node(AST_BLOCK);
+    if (!node) { for (int i=0;i<nstmts;i++) free_ast(stmts[i]); free(stmts); return NULL; }
+    node->u.block.stmts  = stmts;
+    node->u.block.nstmts = nstmts;
+    return node;
+}
+
+/* ── if ──────────────────────────────────────────────────────────────────── */
+
+static AstNode *parse_if(TS *ts)
+{
+    ts_next(ts);  /* consume "if" */
+
+    /* condition: tokens until { */
+    char *buf[MAX_ARGS]; int n = 0;
+    while (ts->pos < ts->n && strcmp(ts_peek(ts), "{") != 0)
+        { buf[n++] = ts->toks[ts->pos++]; if (n >= MAX_ARGS) break; }
+
+    if (n == 0) { fprintf(stderr, "nsh: if: empty condition\n"); return NULL; }
+
+    AstNode *then_b = parse_block(ts);
+    if (!then_b) return NULL;
+
+    AstNode *else_b = NULL;
+    ts_skip_semi(ts);
+    if (ts_peek(ts) && strcmp(ts_peek(ts), "else") == 0) {
+        ts_next(ts);
+        else_b = parse_block(ts);
+    }
+
+    AstNode *node = make_node(AST_IF);
+    if (!node) { free_ast(then_b); free_ast(else_b); return NULL; }
+    node->u.if_n.cond  = malloc(n * sizeof(char *));
+    node->u.if_n.ncond = n;
+    for (int i = 0; i < n; i++) node->u.if_n.cond[i] = strdup(buf[i]);
+    node->u.if_n.then_b = then_b;
+    node->u.if_n.else_b = else_b;
+    return node;
+}
+
+/* ── for ─────────────────────────────────────────────────────────────────── */
+
+static AstNode *parse_for(TS *ts)
+{
+    ts_next(ts);  /* consume "for" */
+
+    const char *var = ts_next(ts);
+    if (!var) { fprintf(stderr, "nsh: for: expected variable name\n"); return NULL; }
+    char *var_name = strdup(var);
+
+    /* optional "in" */
+    if (ts_peek(ts) && strcmp(ts_peek(ts), "in") == 0) ts_next(ts);
+
+    /* word list until { */
+    char **words = NULL; int nwords = 0, wcap = 0;
+    while (ts->pos < ts->n && strcmp(ts_peek(ts), "{") != 0) {
+        if (nwords >= wcap)
+            { wcap = wcap ? wcap*2 : 4; words = realloc(words, wcap * sizeof(char*)); }
+        words[nwords++] = strdup(ts->toks[ts->pos++]);
+    }
+
+    AstNode *body = parse_block(ts);
+    if (!body) {
+        free(var_name);
+        for (int i = 0; i < nwords; i++) free(words[i]);
+        free(words);
+        return NULL;
+    }
+
+    AstNode *node = make_node(AST_FOR);
+    if (!node) { free(var_name); for(int i=0;i<nwords;i++)free(words[i]); free(words); free_ast(body); return NULL; }
+    node->u.for_n.var    = var_name;
+    node->u.for_n.words  = words;
+    node->u.for_n.nwords = nwords;
+    node->u.for_n.body   = body;
+    return node;
+}
+
+/* ── while ───────────────────────────────────────────────────────────────── */
+
+static AstNode *parse_while(TS *ts)
+{
+    ts_next(ts);  /* consume "while" */
+
+    char *buf[MAX_ARGS]; int n = 0;
+    while (ts->pos < ts->n && strcmp(ts_peek(ts), "{") != 0)
+        { buf[n++] = ts->toks[ts->pos++]; if (n >= MAX_ARGS) break; }
+
+    if (n == 0) { fprintf(stderr, "nsh: while: empty condition\n"); return NULL; }
+
+    AstNode *body = parse_block(ts);
+    if (!body) return NULL;
+
+    AstNode *node = make_node(AST_WHILE);
+    if (!node) { free_ast(body); return NULL; }
+    node->u.while_n.cond  = malloc(n * sizeof(char *));
+    node->u.while_n.ncond = n;
+    for (int i = 0; i < n; i++) node->u.while_n.cond[i] = strdup(buf[i]);
+    node->u.while_n.body  = body;
+    return node;
+}
+
+/* ── def ─────────────────────────────────────────────────────────────────── */
+
+static AstNode *parse_def(TS *ts)
+{
+    ts_next(ts);  /* consume "def" */
+
+    const char *name = ts_next(ts);
+    if (!name) { fprintf(stderr, "nsh: def: expected function name\n"); return NULL; }
+    char *fname = strdup(name);
+
+    /* parameter names until { */
+    char **params = NULL; int nparams = 0, pcap = 0;
+    while (ts->pos < ts->n && strcmp(ts_peek(ts), "{") != 0) {
+        if (nparams >= pcap)
+            { pcap = pcap ? pcap*2 : 4; params = realloc(params, pcap * sizeof(char*)); }
+        params[nparams++] = strdup(ts->toks[ts->pos++]);
+    }
+
+    AstNode *body = parse_block(ts);
+    if (!body) {
+        free(fname);
+        for (int i = 0; i < nparams; i++) free(params[i]);
+        free(params);
+        return NULL;
+    }
+
+    AstNode *node = make_node(AST_DEF);
+    if (!node) { free(fname); for(int i=0;i<nparams;i++)free(params[i]); free(params); free_ast(body); return NULL; }
+    node->u.def_n.name    = fname;
+    node->u.def_n.params  = params;
+    node->u.def_n.nparams = nparams;
+    node->u.def_n.body    = body;
+    return node;
+}
+
+/* ── statement dispatcher ────────────────────────────────────────────────── */
+
+static AstNode *parse_stmt(TS *ts)
+{
+    const char *peek = ts_peek(ts);
+    if (!peek) return NULL;
+
+    if (strcmp(peek, "if")    == 0) return parse_if(ts);
+    if (strcmp(peek, "for")   == 0) return parse_for(ts);
+    if (strcmp(peek, "while") == 0) return parse_while(ts);
+    if (strcmp(peek, "def")   == 0) return parse_def(ts);
+
+    return parse_pipeline_ts(ts);
+}
+
+/* ── public entry point ──────────────────────────────────────────────────── */
+
+AstNode *parse_program(char **tokens, int ntokens)
+{
+    TS ts = { tokens, ntokens, 0 };
+
+    AstNode **stmts = NULL;
+    int nstmts = 0, cap = 0;
+
+    for (;;) {
+        ts_skip_semi(&ts);
+        if (ts.pos >= ts.n) break;
+
+        AstNode *s = parse_stmt(&ts);
+        if (!s) break;
+
+        if (nstmts >= cap)
+            { cap = cap ? cap*2 : 4; stmts = realloc(stmts, cap * sizeof(AstNode*)); }
+        stmts[nstmts++] = s;
+    }
+
+    if (nstmts == 0) { free(stmts); return NULL; }
+
+    if (nstmts == 1) {
+        AstNode *single = stmts[0];
+        free(stmts);
+        return single;
+    }
+
+    AstNode *node = make_node(AST_BLOCK);
+    if (!node) { for(int i=0;i<nstmts;i++) free_ast(stmts[i]); free(stmts); return NULL; }
+    node->u.block.stmts  = stmts;
+    node->u.block.nstmts = nstmts;
+    return node;
+}
+
+/* ── AST memory ──────────────────────────────────────────────────────────── */
+
+void free_ast(AstNode *node)
+{
+    if (!node) return;
+    switch (node->kind) {
+    case AST_PIPELINE:
+        for (int i = 0; i < node->u.pipeline.n; i++) free(node->u.pipeline.raw[i]);
+        free(node->u.pipeline.raw);
+        break;
+    case AST_BLOCK:
+        for (int i = 0; i < node->u.block.nstmts; i++)
+            free_ast(node->u.block.stmts[i]);
+        free(node->u.block.stmts);
+        break;
+    case AST_IF:
+        for (int i = 0; i < node->u.if_n.ncond; i++) free(node->u.if_n.cond[i]);
+        free(node->u.if_n.cond);
+        free_ast(node->u.if_n.then_b);
+        free_ast(node->u.if_n.else_b);
+        break;
+    case AST_FOR:
+        free(node->u.for_n.var);
+        for (int i = 0; i < node->u.for_n.nwords; i++) free(node->u.for_n.words[i]);
+        free(node->u.for_n.words);
+        free_ast(node->u.for_n.body);
+        break;
+    case AST_WHILE:
+        for (int i = 0; i < node->u.while_n.ncond; i++) free(node->u.while_n.cond[i]);
+        free(node->u.while_n.cond);
+        free_ast(node->u.while_n.body);
+        break;
+    case AST_DEF:
+        free(node->u.def_n.name);
+        for (int i = 0; i < node->u.def_n.nparams; i++) free(node->u.def_n.params[i]);
+        free(node->u.def_n.params);
+        /* body ownership transferred to ExecCtx — freed by execctx_free() */
+        break;
+    }
+    free(node);
+}
