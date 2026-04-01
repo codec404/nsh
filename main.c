@@ -14,6 +14,13 @@ static void sigchld_handler(int sig)
     got_sigchld = 1;
 }
 
+static sigjmp_buf ctrl_c_jump;
+static void sigint_handler(int sig)
+{
+    (void)sig;
+    siglongjmp(ctrl_c_jump, 1);
+}
+
 /* ── wall-clock timer ───────────────────────────────────────────────────── */
 
 static struct timespec timer_start;
@@ -52,7 +59,7 @@ static void shell_init(void)
     signal(SIGTTOU, SIG_IGN);
     signal(SIGTTIN, SIG_IGN);
     signal(SIGTSTP, SIG_IGN);
-    signal(SIGINT,  SIG_IGN);
+    signal(SIGINT,  sigint_handler);  /* Ctrl+C: jump back to REPL top */
     signal(SIGQUIT, SIG_IGN);
 
     struct sigaction sa;
@@ -63,10 +70,8 @@ static void shell_init(void)
 
     jobs_init();
     shellenv_init();
-    /* hist_open() already called at top of shell_init() — seed readline now */
-
-    complete_init();
-    predict_init();
+    line_editor_init();
+    hist_seed_interactive();
 }
 
 /* ── REPL ───────────────────────────────────────────────────────────────── */
@@ -76,6 +81,13 @@ int main(void)
     shell_init();
 
     while (1) {
+        /* Ctrl+C longjmps here — terminal ECHOCTL already printed "^C",
+         * we just need a newline before the next prompt */
+        if (sigsetjmp(ctrl_c_jump, 1) != 0) {
+            write(STDOUT_FILENO, "\n", 1);
+            last_status = 1;
+        }
+
         if (got_sigchld) {
             got_sigchld = 0;
             reap_jobs();
@@ -86,14 +98,29 @@ int main(void)
 
         if (isatty(STDIN_FILENO)) {
             char *prompt = make_prompt();
-            line = readline(prompt);
+            line = line_editor_read(prompt);
             free(prompt);
 
             if (!line) {
+                if (line_editor_was_interrupted()) {
+                    write(STDOUT_FILENO, "\n", 1);
+                    line_editor_clear_interrupt();
+                    last_status = 1;
+                    continue;
+                }
                 printf("\n");
+                line_editor_shutdown();
                 shellenv_shutdown();
                 hist_close();
                 break;
+            }
+
+            if (line_editor_was_interrupted()) {
+                write(STDOUT_FILENO, "\n", 1);
+                line_editor_clear_interrupt();
+                free(line);
+                last_status = 1;
+                continue;
             }
         } else {
             static char buf[NSH_MAX_INPUT];
@@ -113,12 +140,8 @@ int main(void)
             continue;
         }
 
-        /* add to readline's in-memory ring (dedup consecutive identical) */
-        if (isatty(STDIN_FILENO)) {
-            HIST_ENTRY *prev = history_get(history_length);
-            if (!prev || strcmp(prev->line, trimmed) != 0)
-                add_history(trimmed);
-        }
+        if (isatty(STDIN_FILENO))
+            line_editor_add_history(trimmed);
 
         int ntokens = 0;
         char **tokens = tokenize(trimmed, &ntokens);

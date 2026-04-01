@@ -16,7 +16,7 @@ TARGET   = $(BUILDDIR)/nsh
 OBJDIR   = obj
 SRCS    = main.c lexer.c parser.c builtins.c executor.c jobs.c \
           value.c render.c query.c history.c env_config.c \
-          config.c prompt.c complete.c error.c predict.c
+          config.c prompt.c error.c line_editor.c complete.c
 OBJS    = $(addprefix $(OBJDIR)/, $(SRCS:.c=.o))
 
 .PHONY: all clean

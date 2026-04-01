@@ -9,7 +9,7 @@ A Unix shell written in C, inspired by [Nushell](https://www.nushell.sh). Comman
 brew install readline sqlite
 
 make
-./nsh
+./build/nsh
 ```
 
 ## What it looks like
@@ -91,8 +91,15 @@ size = 1000
 
 Prompt tokens: `%u` user, `%w` cwd, `%g` git branch, `%j` job count, `%e` shellenv depth, `%s` dollar sign.
 
-## Tab completion & prediction
+## Tab completion
 
 - `Tab` — completes commands from PATH, column names after `where`/`select`/`sort-by`, filenames elsewhere
-- `→` / `Ctrl+F` — accept full inline prediction from history
-- `Alt+→` / `Alt+F` — accept one word of the prediction
+
+## Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Tab-complete commands, columns, or filenames |
+| `Ctrl+Z` | Suspend foreground child (or shell if no child) |
+| `Ctrl+L` | Clear screen and scrollback |
+| `Ctrl+C` | Cancel current input, return to fresh prompt |

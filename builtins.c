@@ -319,8 +319,11 @@ static int builtin_shellenv(char **argv, int argc)
  */
 static int builtin_clear(void)
 {
-    system("clear");
-    rl_clear_screen(0, 0);   /* reset readline's notion of cursor position */
+    /* \033[2J  — erase entire screen
+     * \033[3J  — erase scrollback buffer
+     * \033[H   — move cursor to top-left
+     * The next readline() call in the REPL will then draw the prompt there. */
+    write(STDOUT_FILENO, "\033[2J\033[3J\033[H", 12);
     return 0;
 }
 

@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <termios.h>
+#include <setjmp.h>
 
 #define MAX_ARGS      128
 #define NSH_MAX_INPUT 4096
@@ -80,6 +81,7 @@ int   wait_foreground(Job *j);  /* used by fg builtin */
 void      hist_open(void);
 void      hist_close(void);
 void      hist_add(const char *cmdline, int exit_code, int64_t duration_ms);
+void      hist_seed_interactive(void);
 NshTable *hist_query(char **argv, int argc);
 NshTable *hist_sessions(void);
 char    **hist_session_cmds(int64_t session_id, int *out_n);
@@ -114,8 +116,13 @@ char *make_prompt(void);
 /* ── complete.c ─────────────────────────────────────────────────────────── */
 void complete_init(void);
 
-/* ── predict.c ──────────────────────────────────────────────────────────── */
-void predict_init(void);
+/* ── line_editor.c ──────────────────────────────────────────────────────── */
+void  line_editor_init(void);
+void  line_editor_shutdown(void);
+char *line_editor_read(const char *prompt);   /* malloc'd string, NULL on EOF */
+void  line_editor_add_history(const char *line);
+int   line_editor_was_interrupted(void);       /* Ctrl+C during edit */
+void  line_editor_clear_interrupt(void);
 
 /* ── error.c ────────────────────────────────────────────────────────────── */
 void suggest_command_not_found(const char *cmd);

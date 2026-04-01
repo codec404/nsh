@@ -133,6 +133,80 @@ static char *column_generator(const char *text, int state)
     return NULL;
 }
 
+/* ── executable/directory path completion ───────────────────────────────── */
+
+/*
+ * Completes a path prefix (./foo, /usr/bin/ba, ~/bin/x) showing only
+ * entries that are directories or executable files — i.e. things you
+ * can actually run.
+ */
+static char *exec_path_generator(const char *text, int state)
+{
+    static DIR  *dir_handle;
+    static char  dir_part[PATH_MAX];
+    static char  file_prefix[PATH_MAX];
+
+    if (!state) {
+        if (dir_handle) { closedir(dir_handle); dir_handle = NULL; }
+
+        /* split text into directory part and filename prefix */
+        const char *slash = strrchr(text, '/');
+        if (slash) {
+            size_t dlen = (size_t)(slash - text) + 1;  /* include the '/' */
+            strncpy(dir_part,    text,       dlen < PATH_MAX ? dlen : PATH_MAX - 1);
+            dir_part[dlen < PATH_MAX ? dlen : PATH_MAX - 1] = '\0';
+            strncpy(file_prefix, slash + 1,  PATH_MAX - 1);
+        } else {
+            strncpy(dir_part,    "./",    PATH_MAX - 1);
+            strncpy(file_prefix, text,    PATH_MAX - 1);
+        }
+        file_prefix[PATH_MAX - 1] = '\0';
+        dir_part[PATH_MAX - 1]    = '\0';
+
+        dir_handle = opendir(dir_part[0] ? dir_part : ".");
+        if (!dir_handle) return NULL;
+    }
+
+    if (!dir_handle) return NULL;
+
+    struct dirent *ent;
+    size_t pfx_len = strlen(file_prefix);
+
+    while ((ent = readdir(dir_handle))) {
+        /* skip . and .. */
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        /* must match prefix */
+        if (pfx_len > 0 && strncmp(ent->d_name, file_prefix, pfx_len) != 0)
+            continue;
+
+        /* build full path for stat */
+        char full[PATH_MAX];
+        snprintf(full, sizeof(full), "%s%s", dir_part, ent->d_name);
+
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+
+        int is_dir = S_ISDIR(st.st_mode);
+        int is_exe = S_ISREG(st.st_mode) && (st.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH));
+
+        if (!is_dir && !is_exe) continue;
+
+        /* build the completion string: dir_part + name + "/" for dirs */
+        char result[PATH_MAX];
+        if (is_dir)
+            snprintf(result, sizeof(result), "%s%s/", dir_part, ent->d_name);
+        else
+            snprintf(result, sizeof(result), "%s%s",  dir_part, ent->d_name);
+
+        return strdup(result);
+    }
+
+    closedir(dir_handle);
+    dir_handle = NULL;
+    return NULL;
+}
+
 /* ── context detection ───────────────────────────────────────────────────── */
 
 /*
@@ -191,21 +265,41 @@ static char **nsh_complete(const char *text, int start, int end)
     if (is_after_consumer(start))
         return rl_completion_matches(text, column_generator);
 
-    /* path-like text (./foo, /usr, ~/bin) → always filename completion */
-    if (text[0] == '.' || text[0] == '/' || text[0] == '~') {
-        rl_attempted_completion_over = 0;
-        return NULL;
+    if (is_first_word(start)) {
+        /* path prefix in command position → dirs + executables only */
+        if (text[0] == '.' || text[0] == '/' || text[0] == '~')
+            return rl_completion_matches(text, exec_path_generator);
+        return rl_completion_matches(text, command_generator);
     }
 
-    if (is_first_word(start))
-        return rl_completion_matches(text, command_generator);
-
-    /* fall back to readline's built-in filename completion */
+    /* argument position → all files */
     rl_attempted_completion_over = 0;
     return NULL;
+}
+
+static int ctrl_l_handler(int count, int key)
+{
+    (void)count; (void)key;
+    write(STDOUT_FILENO, "\033[2J\033[3J\033[H", 12);
+    rl_on_new_line();
+    rl_forced_update_display();
+    return 0;
+}
+
+static int ctrl_z_handler(int count, int key)
+{
+    (void)count; (void)key;
+    signal(SIGTSTP, SIG_DFL);
+    kill(0, SIGTSTP);
+    signal(SIGTSTP, SIG_IGN);
+    rl_on_new_line();
+    rl_forced_update_display();
+    return 0;
 }
 
 void complete_init(void)
 {
     rl_attempted_completion_function = nsh_complete;
+    rl_bind_key(12, ctrl_l_handler);   /* Ctrl+L — clear screen      */
+    rl_bind_key(26, ctrl_z_handler);   /* Ctrl+Z — suspend           */
 }

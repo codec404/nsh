@@ -15,7 +15,7 @@
  *   ts          INTEGER  — Unix timestamp (seconds)
  */
 #define HIST_DB_FILE "/.nsh_history.db"
-#define HIST_MAX_READLINE 1000   /* entries loaded into readline ring buffer */
+#define HIST_MAX_READLINE 1000   /* entries loaded into interactive line editor */
 
 static sqlite3 *g_db      = NULL;
 static int64_t  g_session = 0;   /* = getpid() of this shell */
@@ -71,38 +71,40 @@ void hist_open(void)
 
     g_session = (int64_t)getpid();
 
-    /*
-     * Seed readline's in-memory ring with the most recent HIST_MAX_READLINE
-     * commands.  Arrow-up will now recall them from SQLite, not just the
-     * flat ~/.nsh_history file (which we no longer write).
-     */
-    const char *seed_sql =
-        "SELECT cmdline FROM history"
-        "  ORDER BY id DESC LIMIT ?;";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(g_db, seed_sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_int(stmt, 1, HIST_MAX_READLINE);
-
-        /* collect in reverse so oldest is add_history()'d first */
-        char *buf[HIST_MAX_READLINE];
-        int   nbuf = 0;
-
-        while (sqlite3_step(stmt) == SQLITE_ROW && nbuf < HIST_MAX_READLINE) {
-            const char *s = (const char *)sqlite3_column_text(stmt, 0);
-            buf[nbuf++]   = s ? strdup(s) : NULL;
-        }
-        sqlite3_finalize(stmt);
-
-        /* add oldest → newest so arrow-up gives newest first */
-        for (int i = nbuf - 1; i >= 0; i--) {
-            if (buf[i]) { add_history(buf[i]); free(buf[i]); }
-        }
-    }
 }
 
 void hist_close(void)
 {
     if (g_db) { sqlite3_close(g_db); g_db = NULL; }
+}
+
+void hist_seed_interactive(void)
+{
+    if (!g_db || !isatty(STDIN_FILENO)) return;
+
+    const char *seed_sql =
+        "SELECT cmdline FROM history"
+        " ORDER BY id DESC LIMIT ?;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_db, seed_sql, -1, &stmt, NULL) != SQLITE_OK) return;
+
+    sqlite3_bind_int(stmt, 1, HIST_MAX_READLINE);
+
+    char *buf[HIST_MAX_READLINE];
+    int nbuf = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && nbuf < HIST_MAX_READLINE) {
+        const char *s = (const char *)sqlite3_column_text(stmt, 0);
+        buf[nbuf++] = s ? strdup(s) : NULL;
+    }
+    sqlite3_finalize(stmt);
+
+    for (int i = nbuf - 1; i >= 0; i--) {
+        if (buf[i]) {
+            line_editor_add_history(buf[i]);
+            free(buf[i]);
+        }
+    }
 }
 
 /* ── record a command ───────────────────────────────────────────────────── */
