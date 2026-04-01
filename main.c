@@ -96,7 +96,7 @@ static int brace_depth(char **toks, int n)
 static void run_input(const char *input, int interactive)
 {
     int ntokens = 0;
-    char **tokens = tokenize((char *)input, &ntokens);
+    char **tokens = tokenize_raw((char *)input, &ntokens);
     if (!tokens || ntokens == 0) { free_tokens(tokens); return; }
 
     AstNode *ast = parse_program(tokens, ntokens);
@@ -210,7 +210,7 @@ int main(int argc, char *argv[])
 
             /* check if braces are balanced */
             int nt = 0;
-            char **toks = tokenize(accum, &nt);
+            char **toks = tokenize_raw(accum, &nt);
             depth = brace_depth(toks, nt);
             free_tokens(toks);
 
