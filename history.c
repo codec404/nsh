@@ -27,6 +27,11 @@ void hist_open(void)
     const char *home = getenv("HOME");
     if (!home) return;
 
+    /* Ensure $HOME exists before SQLite tries to create the db file there.
+     * On a standalone MSYS2 bundle without MSYSTEM set, HOME may point to a
+     * directory that has never been created (e.g. /home/<user>). */
+    mkdir(home, 0755);   /* ignore EEXIST and other errors */
+
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s%s", home, HIST_DB_FILE);
 
