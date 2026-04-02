@@ -1,7 +1,9 @@
 #include "shell.h"
-#include <sys/event.h>
 #include <dirent.h>
 #include <time.h>
+#ifdef __APPLE__
+#include <sys/event.h>
+#endif
 
 /*
  * .shellenv — per-directory environment configuration
@@ -60,10 +62,12 @@ static int       stack_depth = 0;
 
 int shellenv_depth(void) { return stack_depth; }
 
-/* kqueue fd for watching .shellenv files */
+/* kqueue fd for watching .shellenv files (macOS only) */
+#ifdef __APPLE__
 static int kq_fd   = -1;
 static int *kq_wds = NULL;  /* per-stack-entry watch descriptor (kqueue uses file fds) */
 static int *kq_fds = NULL;  /* open file descriptors being watched */
+#endif
 
 /* ── parser ─────────────────────────────────────────────────────────────── */
 
@@ -248,7 +252,9 @@ static void shellenv_unapply(ShellEnv *se)
     se->applied = 0;
 }
 
-/* ── kqueue file watcher ────────────────────────────────────────────────── */
+/* ── kqueue file watcher (macOS only) ──────────────────────────────────── */
+
+#ifdef __APPLE__
 
 void shellenv_watch_init(void)
 {
@@ -331,6 +337,15 @@ void shellenv_check_reload(void)
         }
     }
 }
+
+#else  /* !__APPLE__ — stub implementations for Linux/Windows (MSYS2) */
+
+void shellenv_watch_init(void) { /* no file watching on non-Apple platforms */ }
+static void watch_add(int slot, const char *dir) { (void)slot; (void)dir; }
+static void watch_remove(int slot) { (void)slot; }
+void shellenv_check_reload(void) { /* no-op: kqueue not available */ }
+
+#endif /* __APPLE__ */
 
 /* ── cd hook ────────────────────────────────────────────────────────────── */
 
@@ -436,9 +451,11 @@ void shellenv_shutdown(void)
     }
     stack_depth = 0;
 
+#ifdef __APPLE__
     if (kq_fd >= 0) { close(kq_fd); kq_fd = -1; }
     free(kq_wds); kq_wds = NULL;
     free(kq_fds); kq_fds = NULL;
+#endif
 }
 
 /* ── env diff ───────────────────────────────────────────────────────────── */
